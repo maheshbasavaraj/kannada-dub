@@ -1,0 +1,124 @@
+{
+  "page": {"width_mm": 210, "height_mm": 297, "margins_mm": {"top": 20, "bottom": 20, "left": 20, "right": 20}},
+  "header": "Kannada Dubbing Pipeline — Implementation Guide",
+  "footer_page_numbers": true,
+  "styles": [
+    {"name": "Code", "base": "Normal", "font": "Consolas", "size_pt": 9, "color": "1F3864"}
+  ],
+  "blocks": [
+    {"type": "heading", "text": "Kannada Dubbing Pipeline", "level": 1},
+    {"type": "paragraph", "runs": [{"text": "Implementation Guide", "bold": true, "italic": true}]},
+    {"type": "paragraph", "runs": [
+      {"text": "Project: "}, {"text": "F:\\AI Projects\\kannada-dub", "bold": true}
+    ]},
+    {"type": "paragraph", "text": "Purpose: turn an English YouTube video into a Kannada-dubbed video in which the Kannada narration is spoken in the original narrator's cloned voice, timed to the original speech, and mixed over the original background music."},
+    {"type": "paragraph", "runs": [
+      {"text": "Status: ", "bold": true},
+      {"text": "working end-to-end. The pipeline has been run on a full video and the output verified."}
+    ]},
+
+    {"type": "heading", "text": "Verified output", "level": 2},
+    {"type": "table", "header": ["Property", "Value"], "style": "Light Grid Accent 1", "rows": [
+      ["File", "out/c__DMV_Clog_kn.mp4  (115.5 MB)"],
+      ["Video stream", "VP9, 1920x1080"],
+      ["Audio stream", "AAC, 44100 Hz, stereo"],
+      ["Length", "291.71 s  (source 291.80 s — in sync)"],
+      ["Source video", "Why Every Couple Struggles With Closeness and Distance"],
+      ["Speech units", "68 — all translated and synthesized in the cloned narrator voice"]
+    ]},
+
+    {"type": "heading", "text": "1. How it works — data flow", "level": 2},
+    {"type": "paragraph", "text": "The video is processed in six stages. Each stage writes its result to disk, so a stage can be re-run on its own and finished work is never repeated."},
+    {"type": "table", "header": ["Stage", "What runs", "Output"], "style": "Light Grid Accent 1", "rows": [
+      ["s1_fetch", "yt-dlp download + ffmpeg audio extraction", "meta.json, asr_16k.wav, bed_44k.wav"],
+      ["s2_asr", "faster-whisper with word timestamps", "segments.json — 68 timed English units"],
+      ["s3_mt", "Local Ollama LLM translation to Kannada", "units.json — {start, dur, en, kn}"],
+      ["s4_voice", "Demucs separation + IndicF5 zero-shot clone", "tts/unit_XXXX.wav per unit"],
+      ["s5_fit", "rubberband tempo-fitting into time slots", "narration.wav (one continuous track)"],
+      ["s6_mix", "Ducking, mixing, muxing, subtitles", "out/<id>_kn.mp4 + .srt files"]
+    ]},
+
+    {"type": "heading", "text": "2. Project layout", "level": 2},
+    {"type": "table", "header": ["File", "Lines", "Role"], "style": "Light Grid Accent 1", "rows": [
+      ["dub.py", "88", "CLI entry point; orchestrates stages and resumes work"],
+      ["pipeline/common.py", "128", "Paths, ffmpeg/ffprobe wrappers, JSON and audio helpers"],
+      ["pipeline/s1_fetch.py", "71", "Download, meta.json, speech/bed audio extraction"],
+      ["pipeline/s2_asr.py", "94", "Whisper transcription into timed units"],
+      ["pipeline/s3_mt.py", "225", "Translation, duration budgets, retries"],
+      ["pipeline/s4_voice.py", "239", "Reference extraction + IndicF5 voice cloning"],
+      ["pipeline/s5_fit.py", "79", "rubberband time-fitting into slots"],
+      ["pipeline/s6_mix.py", "61", "Ducking, muxing, subtitle generation"],
+      ["verify.py", "99", "Timing and alignment verification"],
+      ["scripts/prepare_tts_src.py", "106", "Vendors and patches the f5_tts source tree"],
+      ["scripts/verify_tts.py", "105", "Isolated clone test with Whisper read-back"],
+      ["scripts/smoke_tts.py", "78", "Quick TTS smoke test"],
+      ["tts_src/f5_tts/", "-", "Vendored (patched) F5-TTS source"],
+      ["work/, out/, refs/", "-", "Intermediates, final videos, reference clips"]
+    ]},
+
+    {"type": "heading", "text": "3. Stage detail", "level": 2},
+
+    {"type": "heading", "text": "s1_fetch — download and split audio", "level": 3},
+    {"type": "paragraph", "text": "yt-dlp fetches the video at up to 1080p, then ffmpeg produces a mono 16 kHz wav for speech recognition and a full 44.1 kHz wav that becomes the background bed. meta.json records id, title, uploader, url, duration and source path; the id names every later artifact."},
+
+    {"type": "heading", "text": "s2_asr — transcript with timings", "level": 3},
+    {"type": "paragraph", "text": "faster-whisper transcribes with word-level timestamps. Model size and compute type are CLI-selectable. Whisper segments are merged into speech units — one dub-able line each — giving the skeleton of start time, duration and English text. For the reference video: 55 Whisper segments became 68 units, median 2.74 s."},
+
+    {"type": "heading", "text": "s3_mt — translation", "level": 3},
+    {"type": "paragraph", "text": "A local Ollama model translates each unit one request at a time. The unit's duration is passed into the prompt so the model is asked for text that can be spoken within that time. Returned Kannada is validated (empty or English-containing answers are rejected and retried) and partial results are saved every batch so a long run cannot lose everything."},
+
+    {"type": "heading", "text": "s4_voice — the voice cloning core", "level": 3},
+    {"type": "paragraph", "text": "Four jobs: (1) Demucs two-stem separation isolates the narrator's vocal from music and effects; (2) build_ref picks a short clean reference clip (REF_SECONDS = 2.5 to 4.5 seconds) and pairs it with its matching transcript — both halves must agree or the output is babble rather than speech; (3) weight repair fixes the checkpoint key prefix so the model loads completely; (4) synth calls the model once per unit with the reference audio (zero-shot cloning) and the Kannada text; a Vocos vocoder turns the model's mel output into 24 kHz audio, written to tts/unit_XXXX.wav."},
+
+    {"type": "heading", "text": "s5_fit — make it fit the timeline", "level": 3},
+    {"type": "paragraph", "text": "Each clip is placed at its original start time and speed-adjusted with rubberband to fit its slot (tempo is clamped to a maximum, with a small breathing gap). Everything is laid onto one continuous narration.wav. fit.json reports the overflow per unit — how far each line missed its slot — so quality is measurable rather than assumed. For the reference video: 41 units reached the speed cap, worst case 2.18 s late."},
+
+    {"type": "heading", "text": "s6_mix — final assembly", "level": 3},
+    {"type": "paragraph", "text": "The original bed is ducked under the Kannada narration, narration and bed are mixed, and the result is muxed back onto the untouched video stream. Output is out/<id>_kn.mp4 plus Kannada and English .srt subtitles. Flags allow burning subtitles in or overlaying audio without ducking."},
+
+    {"type": "heading", "text": "4. The six bugs that mattered", "level": 2},
+    {"type": "paragraph", "text": "These were the obstacles that had to be diagnosed and fixed before the pipeline produced usable output. Each was confirmed by measurement, not guesswork."},
+    {"type": "table", "header": ["#", "Symptom", "Root cause", "Fix"], "style": "Light Grid Accent 1", "rows": [
+      ["1", "35 minutes of translation produced zero output", "The LLM is a reasoning model: it spent the entire token budget on hidden thinking, so the reply text came back empty", "Disable thinking in the API call — response time dropped from minutes to about 3 seconds"],
+      ["2", "Translation fallback would crash after a long run", "The CLI passed the Ollama model tag as the fallback model repository name", "Pass the two values separately; save partial batches as work proceeds"],
+      ["3", "Synthesized audio was NaN (silent/blank)", "Checkpoint keys were prefixed differently from what the model expects, so zero of 364 tensors loaded and the model ran randomly initialized", "Strip the prefix, enforce a complete 364/364 load, and fail loudly on a partial load"],
+      ["4", "Cloned speech sounded like nonsense babble", "The reference was 11 seconds of audio paired with a 35-word transcript — audio and text disagreed", "Select a short reference whose transcript matches it exactly"],
+      ["5", "Kannada audio far too long for its slot", "Forcing a target duration collapses generation; the model's real duration formula makes the reference length a floor on every line", "Drop forced duration, raise the speed factor, and shorten the reference clip"],
+      ["6", "Individual stages could not be run separately", "Stage data was only built by the earlier recognition/translation stages, so a standalone voice run had nothing to work on", "Load existing artifacts from disk when their producing stage is not part of the run"]
+    ]},
+    {"type": "paragraph", "runs": [
+      {"text": "Environment note: ", "bold": true},
+      {"text": "Windows Smart App Control blocked a security-related library that an audio library pulled in on import. Rather than disable system protection, the audio library was removed from the pipeline entirely and replaced with direct soundfile and numpy equivalents. The same approach replaced an unsupported audio-loading call inside the vendored TTS source."}
+    ]},
+
+    {"type": "heading", "text": "5. Running it", "level": 2},
+    {"type": "paragraph", "text": "Always prefix the virtual environment's Python with an empty PYTHONPATH= (this shell exports one that shadows the environment) and disable TorchDynamo on Windows, where the Triton compiler is unavailable."},
+    {"type": "paragraph", "style": "Code", "text": "cd \"/f/AI Projects/kannada-dub\"\n\n# full pipeline, one command\nPYTHONPATH= TORCHDYNAMO_DISABLE=1 .venv/Scripts/python.exe -u dub.py \\\n  --url \"https://www.youtube.com/watch?v=<ID>\" \\\n  --stages fetch,asr,mt,tts,fit,mix --device cuda\n\n# individual stages (comma-separated; reuses existing artifacts)\n... dub.py --url \"<url>\" --stages tts,fit,mix --device cuda\n... dub.py --url \"<url>\" --stages mt --mt gemma4:12b\n\n# smoke test: synthesize only the first N units\n... dub.py --url \"<url>\" --stages tts --limit 3 --device cuda"},
+    {"type": "paragraph", "text": "A URL or local file is always required (it resolves the video id). Earlier artifacts are reused, so nothing is downloaded again unless fetch is included in the stage list."},
+    {"type": "bullet_list", "items": [
+      "--whisper large-v3 — higher recognition accuracy",
+      "--compute int8 — run on CPU instead of GPU",
+      "--burn-subs — burn subtitles into the picture",
+      "--keep-original-audio — overlay instead of ducking the bed",
+      "--limit N — synthesize only the first N units"
+    ]},
+    {"type": "heading", "text": "Environment", "level": 3},
+    {"type": "bullet_list", "items": [
+      "Python 3.11 virtual environment at .venv with PyTorch 2.11 + CUDA, transformers 4.49, numpy 1.26",
+      "GPU: NVIDIA RTX 4070 Laptop; TORCHDYNAMO_DISABLE=1 is required on Windows",
+      "Ollama running locally with the translation model pulled",
+      "TTS model obtained from a public mirror of IndicF5 (the official repository is gated)"
+    ]},
+
+    {"type": "heading", "text": "6. Verifying a result", "level": 2},
+    {"type": "paragraph", "text": "A zero exit code is not proof of a good result. Two checks are used: inspect the real streams and duration of the output file with ffprobe, and read the fit report in the run log for per-unit tempo and overflow. Synthesis progress appears as [s4] tts N/68 in the log, and a separate script runs an isolated clone with a Whisper read-back to confirm the audio is intelligible Kannada before a long run is committed."},
+
+    {"type": "heading", "text": "7. Known limitations", "level": 2},
+    {"type": "numbered_list", "items": [
+      "Long Kannada lines can overrun their slots. 41 of 68 units reached the tempo cap, worst case 2.18 seconds late, because Kannada often needs more time than the English it replaces. Options: merge very short fragments into longer units, allow a higher tempo maximum, or accept slight drift.",
+      "Very short units (under about 1.5 seconds) are mid-sentence splits from recognition and can sound clipped after compression.",
+      "Windows Smart App Control can still intermittently block a GPU library on long runs. Disabling it removes that class of failure, but the change is one-way.",
+      "Translation quality depends on the local language model, and units are translated independently, so cross-sentence flow relies on the model rather than on document-level context."
+    ]}
+  ]
+}
